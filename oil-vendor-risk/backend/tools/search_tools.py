@@ -1,396 +1,294 @@
 """
-Tool definitions for the Oil Vendor Risk Management agent system.
-Each tool is a proper LangChain BaseTool subclass that can be
-wired into LangGraph agent nodes.
+LangChain tool definitions used by the vendor-risk ReAct agent.
+Each tool is decorated with @tool and returns a plain string so that
+the LLM can parse and reason over the results.
 """
-
+from __future__ import annotations
 import json
-import logging
+import time
+import urllib.parse
 import re
-from datetime import datetime
-from typing import Optional, Type
-import feedparser
+from typing import Optional
 
 import httpx
-from duckduckgo_search import DDGS
-from langchain.tools import BaseTool
-from pydantic import BaseModel, Field
+import feedparser
+from langchain_core.tools import tool
 
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Input schemas (Pydantic)
-# ---------------------------------------------------------------------------
-
-class WebSearchInput(BaseModel):
-    query: str = Field(..., description="Search query string")
-    max_results: int = Field(default=8, description="Maximum number of results to return")
+try:
+    from duckduckgo_search import DDGS
+    _DDG_AVAILABLE = True
+except ImportError:
+    _DDG_AVAILABLE = False
 
 
-class NewsSearchInput(BaseModel):
-    company_name: str = Field(..., description="Company or vendor name to search news for")
-    focus: str = Field(default="risk financial compliance", description="Focus area for the search")
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _safe_text(raw: str, max_chars: int = 800) -> str:
+    """Strip HTML tags and truncate."""
+    clean = re.sub(r"<[^>]+>", " ", raw)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:max_chars]
 
 
-class SocialMediaSearchInput(BaseModel):
-    company_name: str = Field(..., description="Company name to search on social media")
-    topic: str = Field(default="controversy risk scandal", description="Topic to focus the social search on")
+def _ddg_search(query: str, max_results: int = 5) -> list[dict]:
+    """Run a DuckDuckGo text search; fall back gracefully."""
+    if not _DDG_AVAILABLE:
+        return []
+    try:
+        with DDGS() as ddg:
+            results = list(ddg.text(query, max_results=max_results))
+        return results
+    except Exception as exc:
+        return [{"title": "Search error", "body": str(exc), "href": ""}]
 
 
-class YouTubeSearchInput(BaseModel):
-    query: str = Field(..., description="YouTube search query")
-    max_results: int = Field(default=5, description="Max video results to fetch")
+# ── Tool 1 – General Web Search ───────────────────────────────────────────────
+
+@tool
+def web_search(query: str) -> str:
+    """
+    Search the public web for information about a vendor.
+    Use this for general company news, recent events, controversies, and
+    background information.  Input should be a focused search query string.
+    Returns a JSON list of {title, snippet, url} objects.
+    """
+    results = _ddg_search(query, max_results=6)
+    output = []
+    for r in results:
+        output.append({
+            "title": r.get("title", ""),
+            "snippet": _safe_text(r.get("body", ""), 600),
+            "url": r.get("href", ""),
+        })
+    if not output:
+        return json.dumps([{"title": "No results", "snippet": "Could not retrieve web results.", "url": ""}])
+    return json.dumps(output, ensure_ascii=False)
 
 
-class SECFilingSearchInput(BaseModel):
-    company_name: str = Field(..., description="Company name to look up SEC/regulatory filings for")
+# ── Tool 2 – Financial News Feed ──────────────────────────────────────────────
 
-
-class RSSFeedInput(BaseModel):
-    company_name: str = Field(..., description="Company name to monitor via RSS feeds")
-
-
-# ---------------------------------------------------------------------------
-# Tool implementations
-# ---------------------------------------------------------------------------
-
-class WebSearchTool(BaseTool):
-    """Search the web using DuckDuckGo for vendor-related information."""
-
-    name: str = "web_search"
-    description: str = (
-        "Searches the web for information about an oil vendor. "
-        "Use this to find recent news, financial data, regulatory actions, "
-        "press releases, and general company information. "
-        "Input should be a specific search query."
-    )
-    args_schema: Type[BaseModel] = WebSearchInput
-
-    def _run(self, query: str, max_results: int = 8) -> str:
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
-            if not results:
-                return json.dumps({"results": [], "message": "No results found"})
-            formatted = []
-            for r in results:
-                formatted.append({
-                    "title": r.get("title", ""),
-                    "snippet": r.get("body", "")[:400],
-                    "url": r.get("href", ""),
-                    "source": r.get("source", "")
-                })
-            return json.dumps({"results": formatted, "count": len(formatted)})
-        except Exception as e:
-            logger.error(f"WebSearchTool error: {e}")
-            return json.dumps({"error": str(e), "results": []})
-
-    async def _arun(self, query: str, max_results: int = 8) -> str:
-        return self._run(query, max_results)
-
-
-class NewsSearchTool(BaseTool):
-    """Search for recent news articles about a specific oil vendor."""
-
-    name: str = "news_search"
-    description: str = (
-        "Fetches recent news articles about an oil vendor from multiple news sources. "
-        "Focuses on financial health, operational incidents, regulatory violations, "
-        "and reputational events. Returns headlines and summaries."
-    )
-    args_schema: Type[BaseModel] = NewsSearchInput
-
-    def _run(self, company_name: str, focus: str = "risk financial compliance") -> str:
-        try:
-            results = []
-            queries = [
-                f"{company_name} {focus}",
-                f"{company_name} SEC fine penalty lawsuit 2024 2025",
-                f"{company_name} oil spill accident environmental violation",
-                f"{company_name} earnings revenue debt financial results",
-            ]
-            with DDGS() as ddgs:
-                for q in queries:
-                    news = list(ddgs.news(q, max_results=4))
-                    for item in news:
-                        results.append({
-                            "title": item.get("title", ""),
-                            "body": item.get("body", "")[:350],
-                            "url": item.get("url", ""),
-                            "date": item.get("date", ""),
-                            "source": item.get("source", "")
-                        })
-            # Deduplicate by URL
-            seen = set()
-            unique = []
-            for r in results:
-                if r["url"] not in seen:
-                    seen.add(r["url"])
-                    unique.append(r)
-            return json.dumps({"articles": unique[:20], "count": len(unique)})
-        except Exception as e:
-            logger.error(f"NewsSearchTool error: {e}")
-            return json.dumps({"error": str(e), "articles": []})
-
-    async def _arun(self, company_name: str, focus: str = "risk financial compliance") -> str:
-        return self._run(company_name, focus)
-
-
-class SocialMediaSearchTool(BaseTool):
-    """Search social media (X/Twitter via web) for vendor mentions and sentiment."""
-
-    name: str = "social_media_search"
-    description: str = (
-        "Searches social media and public forums for mentions of an oil vendor. "
-        "Looks for whistleblower reports, public controversies, employee complaints, "
-        "activist campaigns, and negative sentiment signals. "
-        "Covers X (Twitter), Reddit, and public forums."
-    )
-    args_schema: Type[BaseModel] = SocialMediaSearchInput
-
-    def _run(self, company_name: str, topic: str = "controversy risk scandal") -> str:
-        try:
-            results = []
-            queries = [
-                f"site:twitter.com OR site:x.com {company_name} {topic}",
-                f"site:reddit.com {company_name} oil vendor risk complaint",
-                f"{company_name} whistleblower fraud misconduct allegation",
-                f"{company_name} workers strike protest environmental activist",
-            ]
-            with DDGS() as ddgs:
-                for q in queries:
-                    items = list(ddgs.text(q, max_results=4))
-                    for item in items:
-                        results.append({
-                            "platform": _detect_platform(item.get("href", "")),
-                            "title": item.get("title", ""),
-                            "snippet": item.get("body", "")[:300],
-                            "url": item.get("href", ""),
-                        })
-            seen = set()
-            unique = [r for r in results if r["url"] not in seen and not seen.add(r["url"])]
-            return json.dumps({"posts": unique[:15], "count": len(unique)})
-        except Exception as e:
-            logger.error(f"SocialMediaSearchTool error: {e}")
-            return json.dumps({"error": str(e), "posts": []})
-
-    async def _arun(self, company_name: str, topic: str = "controversy risk scandal") -> str:
-        return self._run(company_name, topic)
-
-
-class YouTubeSearchTool(BaseTool):
-    """Search YouTube for documentary and news videos about the vendor."""
-
-    name: str = "youtube_search"
-    description: str = (
-        "Searches YouTube for videos about an oil vendor including documentaries, "
-        "news reports, analyst reviews, and investigative journalism. "
-        "Returns video titles, channels, and descriptions as risk signals."
-    )
-    args_schema: Type[BaseModel] = YouTubeSearchInput
-
-    def _run(self, query: str, max_results: int = 5) -> str:
-        try:
-            results = []
-            yt_queries = [
-                f"{query} investigation documentary",
-                f"{query} oil spill scandal controversy",
-                f"{query} financial crisis debt",
-            ]
-            with DDGS() as ddgs:
-                for q in yt_queries:
-                    items = list(ddgs.text(
-                        f"site:youtube.com {q}", max_results=max_results
-                    ))
-                    for item in items:
-                        results.append({
-                            "title": item.get("title", ""),
-                            "description": item.get("body", "")[:250],
-                            "url": item.get("href", ""),
-                            "channel": _extract_yt_channel(item.get("body", ""))
-                        })
-            seen = set()
-            unique = [r for r in results if r["url"] not in seen and not seen.add(r["url"])]
-            return json.dumps({"videos": unique[:12], "count": len(unique)})
-        except Exception as e:
-            logger.error(f"YouTubeSearchTool error: {e}")
-            return json.dumps({"error": str(e), "videos": []})
-
-    async def _arun(self, query: str, max_results: int = 5) -> str:
-        return self._run(query, max_results)
-
-
-class RegulatorySearchTool(BaseTool):
-    """Search for SEC filings, regulatory actions, and compliance violations."""
-
-    name: str = "regulatory_search"
-    description: str = (
-        "Searches for regulatory actions, SEC filings, EPA violations, OSHA incidents, "
-        "court cases, and compliance issues for an oil vendor. "
-        "Critical for compliance risk assessment."
-    )
-    args_schema: Type[BaseModel] = SECFilingSearchInput
-
-    def _run(self, company_name: str) -> str:
-        try:
-            results = []
-            queries = [
-                f"{company_name} SEC enforcement action fine penalty",
-                f"{company_name} EPA violation environmental penalty",
-                f"{company_name} OSHA workplace safety violation",
-                f"site:sec.gov {company_name} filing 10-K 8-K",
-                f"{company_name} regulatory sanction compliance failure 2023 2024 2025",
-                f"{company_name} class action lawsuit settlement court",
-            ]
-            with DDGS() as ddgs:
-                for q in queries:
-                    items = list(ddgs.text(q, max_results=4))
-                    for item in items:
-                        results.append({
-                            "title": item.get("title", ""),
-                            "snippet": item.get("body", "")[:400],
-                            "url": item.get("href", ""),
-                            "type": _classify_regulatory(item.get("title", "") + " " + item.get("body", ""))
-                        })
-            seen = set()
-            unique = [r for r in results if r["url"] not in seen and not seen.add(r["url"])]
-            return json.dumps({"filings": unique[:16], "count": len(unique)})
-        except Exception as e:
-            logger.error(f"RegulatorySearchTool error: {e}")
-            return json.dumps({"error": str(e), "filings": []})
-
-    async def _arun(self, company_name: str) -> str:
-        return self._run(company_name)
-
-
-class FinancialDataTool(BaseTool):
-    """Retrieve financial health indicators for an oil vendor."""
-
-    name: str = "financial_data"
-    description: str = (
-        "Fetches financial health data for an oil vendor: credit ratings, "
-        "debt levels, earnings trends, cash flow, bankruptcy risk signals, "
-        "stock performance, and analyst downgrades. "
-        "Use this to assess financial risk."
-    )
-    args_schema: Type[BaseModel] = SECFilingSearchInput
-
-    def _run(self, company_name: str) -> str:
-        try:
-            results = []
-            queries = [
-                f"{company_name} credit rating downgrade Moody S&P Fitch",
-                f"{company_name} debt leverage balance sheet 2024 2025",
-                f"{company_name} bankruptcy default financial distress",
-                f"{company_name} annual earnings revenue profit loss 2024",
-                f"{company_name} stock price analyst target downgrade",
-            ]
-            with DDGS() as ddgs:
-                for q in queries:
-                    items = list(ddgs.text(q, max_results=4))
-                    for item in items:
-                        results.append({
-                            "title": item.get("title", ""),
-                            "snippet": item.get("body", "")[:400],
-                            "url": item.get("href", ""),
-                            "category": "financial"
-                        })
-            seen = set()
-            unique = [r for r in results if r["url"] not in seen and not seen.add(r["url"])]
-            return json.dumps({"financial_data": unique[:16], "count": len(unique)})
-        except Exception as e:
-            logger.error(f"FinancialDataTool error: {e}")
-            return json.dumps({"error": str(e), "financial_data": []})
-
-    async def _arun(self, company_name: str) -> str:
-        return self._run(company_name)
-
-
-class OperationalRiskTool(BaseTool):
-    """Search for operational incidents, outages, and supply chain risks."""
-
-    name: str = "operational_risk_search"
-    description: str = (
-        "Searches for operational risk signals: refinery outages, pipeline incidents, "
-        "supply chain disruptions, logistics failures, geopolitical exposure, "
-        "and infrastructure vulnerability for an oil vendor."
-    )
-    args_schema: Type[BaseModel] = SECFilingSearchInput
-
-    def _run(self, company_name: str) -> str:
-        try:
-            results = []
-            queries = [
-                f"{company_name} refinery fire explosion outage shutdown 2024 2025",
-                f"{company_name} pipeline leak spill incident",
-                f"{company_name} supply chain disruption shortage",
-                f"{company_name} geopolitical exposure sanctions country risk",
-                f"{company_name} operational failure maintenance issue",
-            ]
-            with DDGS() as ddgs:
-                for q in queries:
-                    items = list(ddgs.text(q, max_results=4))
-                    for item in items:
-                        results.append({
-                            "title": item.get("title", ""),
-                            "snippet": item.get("body", "")[:400],
-                            "url": item.get("href", ""),
-                            "category": "operational"
-                        })
-            seen = set()
-            unique = [r for r in results if r["url"] not in seen and not seen.add(r["url"])]
-            return json.dumps({"incidents": unique[:15], "count": len(unique)})
-        except Exception as e:
-            logger.error(f"OperationalRiskTool error: {e}")
-            return json.dumps({"error": str(e), "incidents": []})
-
-    async def _arun(self, company_name: str) -> str:
-        return self._run(company_name)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _detect_platform(url: str) -> str:
-    if "twitter.com" in url or "x.com" in url:
-        return "X (Twitter)"
-    if "reddit.com" in url:
-        return "Reddit"
-    if "linkedin.com" in url:
-        return "LinkedIn"
-    return "Web"
-
-
-def _extract_yt_channel(text: str) -> str:
-    match = re.search(r"by ([A-Za-z0-9 ]+) on YouTube", text)
-    if match:
-        return match.group(1).strip()
-    return "Unknown Channel"
-
-
-def _classify_regulatory(text: str) -> str:
-    text_lower = text.lower()
-    if any(w in text_lower for w in ["sec", "filing", "10-k", "8-k"]):
-        return "SEC Filing"
-    if any(w in text_lower for w in ["epa", "environmental"]):
-        return "Environmental"
-    if any(w in text_lower for w in ["osha", "workplace", "safety"]):
-        return "Safety/OSHA"
-    if any(w in text_lower for w in ["lawsuit", "court", "settlement"]):
-        return "Legal"
-    return "Regulatory"
-
-
-def get_all_tools() -> list:
-    """Return all tool instances for use in LangGraph agents."""
-    return [
-        WebSearchTool(),
-        NewsSearchTool(),
-        SocialMediaSearchTool(),
-        YouTubeSearchTool(),
-        RegulatorySearchTool(),
-        FinancialDataTool(),
-        OperationalRiskTool(),
+@tool
+def financial_news_search(vendor_name: str) -> str:
+    """
+    Retrieve the latest financial news for the vendor from RSS feeds
+    (Reuters, Bloomberg RSS mirrors, Yahoo Finance).
+    Use this to surface earnings reports, credit events, downgrades,
+    debt issues, or M&A activity.
+    Returns a JSON list of {title, summary, published, source} objects.
+    """
+    feeds = [
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={urllib.parse.quote(vendor_name)}&region=US&lang=en-US",
+        f"https://news.google.com/rss/search?q={urllib.parse.quote(vendor_name + ' oil financial')}&hl=en-US&gl=US&ceid=US:en",
     ]
+    items = []
+    for url in feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:4]:
+                items.append({
+                    "title": entry.get("title", ""),
+                    "summary": _safe_text(entry.get("summary", ""), 400),
+                    "published": entry.get("published", ""),
+                    "source": feed.feed.get("title", url),
+                })
+        except Exception:
+            continue
+        if len(items) >= 6:
+            break
+
+    # Supplement with DDG news
+    ddg_results = _ddg_search(f"{vendor_name} financial results earnings debt 2024 2025", max_results=4)
+    for r in ddg_results:
+        items.append({
+            "title": r.get("title", ""),
+            "summary": _safe_text(r.get("body", ""), 400),
+            "published": "",
+            "source": "DuckDuckGo News",
+        })
+
+    if not items:
+        return json.dumps([{"title": "No financial news found", "summary": "", "published": "", "source": ""}])
+    return json.dumps(items[:8], ensure_ascii=False)
+
+
+# ── Tool 3 – Regulatory & Compliance Search ───────────────────────────────────
+
+@tool
+def compliance_search(vendor_name: str) -> str:
+    """
+    Search for regulatory actions, fines, ESG violations, sanctions,
+    environmental incidents, or compliance failures associated with the vendor.
+    Returns a JSON list of {title, snippet, url} objects.
+    """
+    queries = [
+        f"{vendor_name} regulatory fine penalty SEC CFTC EPA 2023 2024 2025",
+        f"{vendor_name} ESG environmental violation compliance breach",
+        f"{vendor_name} sanctions OFAC corruption bribery lawsuit",
+    ]
+    all_results = []
+    for q in queries:
+        results = _ddg_search(q, max_results=3)
+        for r in results:
+            all_results.append({
+                "title": r.get("title", ""),
+                "snippet": _safe_text(r.get("body", ""), 500),
+                "url": r.get("href", ""),
+            })
+        time.sleep(0.3)
+
+    if not all_results:
+        return json.dumps([{"title": "No compliance issues found in search", "snippet": "", "url": ""}])
+    return json.dumps(all_results[:8], ensure_ascii=False)
+
+
+# ── Tool 4 – Social Media / X Search ─────────────────────────────────────────
+
+@tool
+def social_media_search(vendor_name: str) -> str:
+    """
+    Search for recent social media signals about the vendor on X (Twitter)
+    and Reddit.  Looks for sentiment shifts, viral controversies, supply
+    disruption rumours, and protest activity.
+    Returns a JSON list of {title, snippet, url, platform} objects.
+    """
+    queries = [
+        f"site:twitter.com OR site:x.com {vendor_name} oil supply risk controversy",
+        f"site:reddit.com {vendor_name} oil vendor risk opinion",
+        f"{vendor_name} oil social media controversy boycott protest 2025",
+    ]
+    all_results = []
+    for q in queries:
+        results = _ddg_search(q, max_results=3)
+        for r in results:
+            url = r.get("href", "")
+            platform = "X/Twitter" if "twitter.com" in url or "x.com" in url else \
+                       "Reddit" if "reddit.com" in url else "Web"
+            all_results.append({
+                "title": r.get("title", ""),
+                "snippet": _safe_text(r.get("body", ""), 400),
+                "url": url,
+                "platform": platform,
+            })
+        time.sleep(0.3)
+
+    if not all_results:
+        return json.dumps([{"title": "No social signals found", "snippet": "", "url": "", "platform": ""}])
+    return json.dumps(all_results[:8], ensure_ascii=False)
+
+
+# ── Tool 5 – YouTube / Video Intelligence ────────────────────────────────────
+
+@tool
+def video_intelligence_search(vendor_name: str) -> str:
+    """
+    Search YouTube and video platforms for documentary footage, analyst
+    interviews, investor day recordings, protest coverage, or safety incident
+    footage related to the vendor.
+    Returns a JSON list of {title, description, url, channel} objects.
+    """
+    query = f"{vendor_name} oil company risk analysis documentary interview 2024 2025"
+    # Use DDG to surface YouTube links
+    results = _ddg_search(f"site:youtube.com {query}", max_results=5)
+    items = []
+    for r in results:
+        items.append({
+            "title": r.get("title", ""),
+            "description": _safe_text(r.get("body", ""), 400),
+            "url": r.get("href", ""),
+            "channel": "YouTube",
+        })
+
+    # Also search for news video coverage
+    news_results = _ddg_search(f"{vendor_name} oil spill safety incident video news", max_results=3)
+    for r in news_results:
+        items.append({
+            "title": r.get("title", ""),
+            "description": _safe_text(r.get("body", ""), 400),
+            "url": r.get("href", ""),
+            "channel": "News Video",
+        })
+
+    if not items:
+        return json.dumps([{"title": "No video content found", "description": "", "url": "", "channel": ""}])
+    return json.dumps(items[:6], ensure_ascii=False)
+
+
+# ── Tool 6 – Geopolitical Risk Search ────────────────────────────────────────
+
+@tool
+def geopolitical_risk_search(vendor_name: str) -> str:
+    """
+    Assess geopolitical risks: country of operations, political instability,
+    conflict zones, OPEC+ decisions affecting the vendor, and trade restrictions.
+    Returns a JSON list of {title, snippet, url} objects.
+    """
+    queries = [
+        f"{vendor_name} oil geopolitical risk country operations 2024 2025",
+        f"{vendor_name} OPEC sanctions trade war supply disruption",
+        f"{vendor_name} political instability region conflict operations",
+    ]
+    all_results = []
+    for q in queries:
+        results = _ddg_search(q, max_results=3)
+        for r in results:
+            all_results.append({
+                "title": r.get("title", ""),
+                "snippet": _safe_text(r.get("body", ""), 500),
+                "url": r.get("href", ""),
+            })
+        time.sleep(0.3)
+
+    if not all_results:
+        return json.dumps([{"title": "No geopolitical data found", "snippet": "", "url": ""}])
+    return json.dumps(all_results[:8], ensure_ascii=False)
+
+
+# ── Tool 7 – Operational Incident Search ─────────────────────────────────────
+
+@tool
+def operational_incident_search(vendor_name: str) -> str:
+    """
+    Search for operational disruptions: pipeline failures, refinery outages,
+    oil spills, cyber attacks, labour strikes, and supply chain interruptions.
+    Returns a JSON list of {title, snippet, url, incident_type} objects.
+    """
+    queries = [
+        f"{vendor_name} oil spill pipeline failure refinery outage 2023 2024 2025",
+        f"{vendor_name} cyberattack ransomware operational disruption",
+        f"{vendor_name} workers strike labour dispute supply chain",
+    ]
+    all_results = []
+    for q in queries:
+        results = _ddg_search(q, max_results=3)
+        for r in results:
+            title = r.get("title", "").lower()
+            incident_type = (
+                "Cyber" if any(w in title for w in ["cyber", "hack", "ransom"]) else
+                "Environmental" if any(w in title for w in ["spill", "leak", "environ"]) else
+                "Labour" if any(w in title for w in ["strike", "worker", "labour", "union"]) else
+                "Infrastructure"
+            )
+            all_results.append({
+                "title": r.get("title", ""),
+                "snippet": _safe_text(r.get("body", ""), 500),
+                "url": r.get("href", ""),
+                "incident_type": incident_type,
+            })
+        time.sleep(0.3)
+
+    if not all_results:
+        return json.dumps([{"title": "No operational incidents found", "snippet": "", "url": "", "incident_type": ""}])
+    return json.dumps(all_results[:8], ensure_ascii=False)
+
+
+# ── Export all tools ──────────────────────────────────────────────────────────
+
+ALL_TOOLS = [
+    web_search,
+    financial_news_search,
+    compliance_search,
+    social_media_search,
+    video_intelligence_search,
+    geopolitical_risk_search,
+    operational_incident_search,
+]

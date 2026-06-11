@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OIL Vendor Risk Management</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛢️</text></svg>" />
+</head>
+<body>
+<div class="app-shell">
+
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-brand">
+      <div class="header-icon">🛢️</div>
+      <div>
+        <div class="header-title">OIL Vendor Risk Intelligence</div>
+        <div class="header-sub">Third-Party Risk Management Platform</div>
+      </div>
+    </div>
+    <div class="header-badge">Powered by LangGraph + AMD ROCm</div>
+  </header>
+
+  <!-- ── Main ───────────────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+
+      <!-- Assess input -->
+      <div class="sidebar-section">
+        <div class="sidebar-label">Run Assessment</div>
+        <div class="vendor-input-wrap">
+          <input
+            id="vendorName"
+            class="input-field"
+            type="text"
+            placeholder="Vendor name, e.g. ExxonMobil"
+            autocomplete="off"
+          />
+          <input
+            id="vendorTicker"
+            class="input-field"
+            type="text"
+            placeholder="Ticker (optional, e.g. XOM)"
+            autocomplete="off"
+          />
+          <button id="assessBtn" class="assess-btn">
+            <span>🔍</span>
+            <span>Assess Risk</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Preset vendors -->
+      <div class="sidebar-section">
+        <div class="sidebar-label">Quick Select — Real Vendors</div>
+        <div class="preset-cards" id="presetCards">
+          <div style="color:#9B9589;font-size:0.8rem;">Loading…</div>
+        </div>
+      </div>
+
+      <!-- History -->
+      <div class="sidebar-section">
+        <div class="sidebar-label">Recent Assessments</div>
+        <div class="history-list" id="historyList">
+          <div style="color:#9B9589;font-size:0.8rem;">No assessments yet.</div>
+        </div>
+      </div>
+
+      <!-- Legend -->
+      <div class="sidebar-section">
+        <div class="sidebar-label">Risk Levels</div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;">
+            <span class="history-badge badge-critical">Critical</span>
+            <span style="color:#6B6559;">Score 76–100</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;">
+            <span class="history-badge badge-high">High</span>
+            <span style="color:#6B6559;">Score 51–75</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;">
+            <span class="history-badge badge-medium">Medium</span>
+            <span style="color:#6B6559;">Score 26–50</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;">
+            <span class="history-badge badge-low">Low</span>
+            <span style="color:#6B6559;">Score 0–25</span>
+          </div>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- Content -->
+    <section class="content" id="contentArea">
+      <!-- Filled dynamically -->
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

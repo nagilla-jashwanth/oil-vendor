@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# start_vllm.sh — Launch vLLM server on AMD GPU (ROCm)
-#
-# Prerequisites:
-#   - ROCm 6.x installed
-#   - vLLM installed (pip install vllm)
-#   - At least 16 GB GPU VRAM for Mistral-7B (use fp16)
-#
-# Usage: bash start_vllm.sh [model_name]
+# ─────────────────────────────────────────────────────────────────────────────
+# Start vLLM on AMD ROCm GPU
+# Run this FIRST, in a separate terminal, before run.sh
+# ─────────────────────────────────────────────────────────────────────────────
 
-MODEL="${1:-mistralai/Mistral-7B-Instruct-v0.3}"
-HOST="0.0.0.0"
-PORT="8000"
+# Load .env
+set -a; source .env 2>/dev/null; set +a
 
-echo "================================================"
-echo " Starting vLLM OpenAI-compatible server"
-echo " Model : $MODEL"
-echo " Device: AMD GPU (ROCm)"
-echo " URL   : http://$HOST:$PORT/v1"
-echo "================================================"
+MODEL=${VLLM_MODEL_NAME:-"mistralai/Mistral-7B-Instruct-v0.3"}
+PORT=8000
 
-python -m vllm.entrypoints.openai.api_server \
-  --model "$MODEL" \
-  --host "$HOST" \
-  --port "$PORT" \
+echo ""
+echo "▶ Starting vLLM server"
+echo "  Model : ${MODEL}"
+echo "  Port  : ${PORT}"
+echo ""
+echo "  AMD GPU info:"
+rocm-smi --showid --showproductname 2>/dev/null || echo "  (rocm-smi not found — proceeding)"
+echo ""
+
+# vLLM with ROCm uses the same CLI as CUDA; ROCm is auto-detected
+python3 -m vllm.entrypoints.openai.api_server \
+  --model "${MODEL}" \
+  --port ${PORT} \
+  --host 0.0.0.0 \
   --dtype float16 \
-  --max-model-len 4096 \
-  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.85 \
   --trust-remote-code
 
-# If you run into VRAM issues, try:
-#   --quantization awq
-# Or switch to a smaller model:
-#   mistralai/Mistral-7B-Instruct-v0.1
-#   TinyLlama/TinyLlama-1.1B-Chat-v1.0  (for testing)
+# Notes:
+# • For larger models (13B+) lower --gpu-memory-utilization to 0.75
+# • Add --tensor-parallel-size 2 if you have 2 GPUs
+# • Mistral-7B-Instruct fits comfortably on a single MI250/MI300 in float16

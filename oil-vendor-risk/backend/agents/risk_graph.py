@@ -1,505 +1,329 @@
 """
-LangGraph-based multi-agent system for Oil Vendor Risk Assessment.
+Vendor Risk LangGraph Pipeline
+================================
+Graph topology (sequential with a ReAct intelligence node):
 
-Architecture:
-  orchestrator_node  ──► financial_agent_node
-                     ──► operational_agent_node
-                     ──► compliance_agent_node
-                     ──► social_agent_node
-                          └─► aggregator_node ──► END
-
-Each specialist agent has its own tool subset and system prompt.
-The aggregator synthesises all findings into a final risk report.
+  START
+    │
+    ▼
+ [intelligence_node]   ← ReAct agent: calls all 7 search tools in any order
+    │                    until it decides it has enough data
+    ▼
+ [scoring_node]         ← LLM synthesises findings into category scores
+    │
+    ▼
+ [mitigation_node]      ← LLM generates prioritised mitigation actions
+    │
+    ▼
+  END  →  AgentState.assessment is populated
 """
+from __future__ import annotations
 
 import json
+import re
 import logging
-import os
-from datetime import datetime
-from typing import Any, Dict, List, Optional, TypedDict, Annotated
-import operator
+from typing import Any
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
-from langchain_openai import ChatOpenAI
-from langgraph.graph import END, StateGraph
-from langgraph.prebuilt import ToolNode
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import create_react_agent
 
-from tools.search_tools import (
-    FinancialDataTool,
-    NewsSearchTool,
-    OperationalRiskTool,
-    RegulatorySearchTool,
-    SocialMediaSearchTool,
-    WebSearchTool,
-    YouTubeSearchTool,
+from backend.models.schemas import (
+    AgentState, RiskAssessment, RiskFinding, MitigationAction,
 )
+from backend.tools import ALL_TOOLS
+from backend.agents.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Graph State
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# Prompts
+# ────────────────────────────────────────────────────────────────────────────
 
-class AgentState(TypedDict):
-    """Shared state passed through all nodes in the LangGraph graph."""
-    vendor_name: str
-    additional_context: str
+INTEL_SYSTEM = """You are a senior vendor-risk intelligence analyst specialising in the global oil & gas industry.
+Your task is to gather comprehensive risk intelligence about a vendor using the tools available to you.
 
-    # Collected findings from each specialist
-    financial_findings: str
-    operational_findings: str
-    compliance_findings: str
-    social_findings: str
+You MUST use ALL of the following tools at least once:
+- web_search
+- financial_news_search
+- compliance_search
+- social_media_search
+- video_intelligence_search
+- geopolitical_risk_search
+- operational_incident_search
 
-    # Aggregated final report (JSON string)
-    final_report: Optional[str]
+For each tool call, craft a specific query targeting the vendor.
+After gathering data, write a structured intelligence brief with sections:
+FINANCIAL INTELLIGENCE, OPERATIONAL INTELLIGENCE, COMPLIANCE INTELLIGENCE,
+REPUTATIONAL / SOCIAL INTELLIGENCE, GEOPOLITICAL INTELLIGENCE.
+Each section should summarise the key findings and cite sources."""
 
-    # Status messages for SSE streaming to frontend
-    status_messages: Annotated[List[Dict[str, Any]], operator.add]
+SCORING_SYSTEM = """You are a quantitative risk analyst. Given an intelligence brief about an oil vendor,
+you must produce a structured JSON risk assessment.
 
-    # Internal message history for each agent (kept separate to avoid context bleed)
-    financial_messages: List[BaseMessage]
-    operational_messages: List[BaseMessage]
-    compliance_messages: List[BaseMessage]
-    social_messages: List[BaseMessage]
-    aggregator_messages: List[BaseMessage]
+Scoring guidelines (0 = no risk, 100 = extreme risk):
+- financial_score: Debt levels, credit ratings, earnings volatility, liquidity concerns
+- operational_score: Supply disruptions, infrastructure failures, cyber incidents, safety record
+- compliance_score: Regulatory fines, environmental violations, sanctions exposure, ESG failures
+- reputational_score: Social media sentiment, controversies, boycotts, brand damage
+- geopolitical_score: Country risk, OPEC+ exposure, conflict proximity, sanctions risk
 
-    error: Optional[str]
+overall_score = weighted average:
+  financial×0.25 + operational×0.20 + compliance×0.25 + reputational×0.15 + geopolitical×0.15
 
+risk_level thresholds:
+  0–25 → "low"
+  26–50 → "medium"
+  51–75 → "high"
+  76–100 → "critical"
 
-# ---------------------------------------------------------------------------
-# LLM factory (points to local vLLM)
-# ---------------------------------------------------------------------------
-
-def _make_llm(tools: Optional[list] = None) -> ChatOpenAI:
-    """
-    Creates a ChatOpenAI client that targets the local vLLM OpenAI-compatible
-    endpoint.  AMD ROCm vLLM exposes the same API as OpenAI so we can reuse
-    langchain-openai without any changes.
-    """
-    base_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
-    model = os.getenv("VLLM_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
-
-    llm = ChatOpenAI(
-        base_url=base_url,
-        api_key="EMPTY",          # vLLM doesn't need a real key
-        model=model,
-        temperature=0.1,
-        max_tokens=2048,
-    )
-    if tools:
-        llm = llm.bind_tools(tools)
-    return llm
-
-
-# ---------------------------------------------------------------------------
-# Specialist prompts
-# ---------------------------------------------------------------------------
-
-FINANCIAL_SYSTEM_PROMPT = """You are a financial risk analyst specialising in oil & gas companies.
-Your job is to gather and analyse financial health signals for the vendor provided.
-Use your available tools to search for:
-- Credit ratings, debt levels, leverage ratios
-- Earnings trends, revenue trajectory, free cash flow
-- Analyst downgrades, price targets
-- Signs of financial distress or bankruptcy risk
-- Recent capital market events
-
-When you have gathered sufficient data, produce a JSON object with this structure:
+Return ONLY a JSON object with this exact schema (no markdown, no extra text):
 {
-  "summary": "<2-3 sentence executive summary>",
-  "signals": [
-    {"signal": "<finding>", "severity": <0-10>, "source": "<source name>", "url": "<url or empty>"}
-  ],
-  "score": <0-100 financial risk score where 100 is highest risk>
-}
-Be thorough. Call multiple tools if needed. Respond ONLY with the JSON when done."""
-
-OPERATIONAL_SYSTEM_PROMPT = """You are an operational risk analyst specialising in oil & gas supply chains.
-Your job is to assess operational risk for the vendor provided.
-Use your available tools to find:
-- Refinery incidents, fires, explosions, shutdowns
-- Pipeline leaks or spills
-- Supply chain disruptions
-- Geopolitical exposure and sanctions risk
-- Infrastructure vulnerabilities
-- Key-person dependencies
-
-When you have gathered sufficient data, produce a JSON object:
-{
-  "summary": "<2-3 sentence executive summary>",
-  "signals": [
-    {"signal": "<finding>", "severity": <0-10>, "source": "<source name>", "url": "<url or empty>"}
-  ],
-  "score": <0-100 operational risk score where 100 is highest risk>
-}
-Be thorough. Call multiple tools if needed. Respond ONLY with the JSON when done."""
-
-COMPLIANCE_SYSTEM_PROMPT = """You are a compliance and regulatory risk analyst for the energy sector.
-Your job is to assess regulatory and compliance risk for the vendor provided.
-Use your available tools to find:
-- SEC enforcement actions and fines
-- EPA environmental violations and penalties
-- OSHA safety violations
-- Anti-bribery/FCPA violations
-- Sanctions violations
-- Ongoing litigation and class actions
-
-When you have gathered sufficient data, produce a JSON object:
-{
-  "summary": "<2-3 sentence executive summary>",
-  "signals": [
-    {"signal": "<finding>", "severity": <0-10>, "source": "<source name>", "url": "<url or empty>"}
-  ],
-  "score": <0-100 compliance risk score where 100 is highest risk>
-}
-Be thorough. Call multiple tools if needed. Respond ONLY with the JSON when done."""
-
-SOCIAL_SYSTEM_PROMPT = """You are a reputational and social risk analyst for the energy sector.
-Your job is to assess reputational risk for the vendor provided.
-Use your available tools to find:
-- Social media controversies and negative sentiment
-- Whistleblower reports
-- Employee complaints and strikes
-- Activist campaigns
-- YouTube investigative journalism
-- ESG controversies
-
-When you have gathered sufficient data, produce a JSON object:
-{
-  "summary": "<2-3 sentence executive summary>",
-  "signals": [
-    {"signal": "<finding>", "severity": <0-10>, "source": "<source name>", "url": "<url or empty>"}
-  ],
-  "score": <0-100 reputational risk score where 100 is highest risk>
-}
-Be thorough. Call multiple tools if needed. Respond ONLY with the JSON when done."""
-
-AGGREGATOR_SYSTEM_PROMPT = """You are a senior vendor risk officer at an oil procurement company.
-You have received specialist risk assessments from four analyst teams.
-Your job is to synthesise them into a final, actionable risk report.
-
-Produce a JSON object with EXACTLY this structure (no markdown, no extra text):
-{
-  "vendor_name": "<vendor name>",
-  "vendor_description": "<1-2 sentence description of the company>",
+  "financial_score": <float>,
+  "operational_score": <float>,
+  "compliance_score": <float>,
+  "reputational_score": <float>,
+  "geopolitical_score": <float>,
+  "overall_score": <float>,
   "risk_level": "<low|medium|high|critical>",
-  "risk_score": {
-    "overall": <0-100>,
-    "financial": <0-100>,
-    "operational": <0-100>,
-    "compliance": <0-100>,
-    "reputational": <0-100>,
-    "geopolitical": <0-100>
-  },
-  "signals": [
+  "findings": [
     {
       "category": "<financial|operational|compliance|reputational|geopolitical>",
-      "signal": "<finding>",
-      "source": "<source>",
-      "severity": <0-10>,
-      "url": "<url or empty>"
+      "severity": "<critical|high|medium|low>",
+      "title": "<short title>",
+      "detail": "<2-3 sentence explanation>",
+      "source": "<url or source name>"
     }
   ],
-  "mitigation_actions": [
-    {
-      "action": "<specific action>",
-      "priority": "<immediate|short-term|long-term>",
-      "category": "<financial|operational|compliance|reputational|geopolitical>",
-      "rationale": "<why this action>"
-    }
-  ],
-  "executive_summary": "<3-5 sentence summary for procurement leadership>",
-  "data_sources_used": ["<source1>", "<source2>"],
-  "assessment_timestamp": "<ISO timestamp>"
-}
+  "summary": "<3-4 sentence executive summary>",
+  "sources_consulted": ["<url1>", "<url2>"]
+}"""
 
-Rules:
-- overall score = weighted average (financial 25%, operational 25%, compliance 25%, reputational 15%, geopolitical 10%)
-- risk_level: 0-30=low, 31-55=medium, 56-75=high, 76-100=critical
-- Include at least 3 mitigation actions per risk category that scored above 40
-- Respond ONLY with the JSON object."""
+MITIGATION_SYSTEM = """You are a strategic risk management consultant for an oil procurement organisation.
+Given a vendor risk assessment JSON, generate a prioritised list of mitigation actions.
+
+Return ONLY a JSON array (no markdown, no extra text) with this schema:
+[
+  {
+    "priority": "<immediate|short_term|long_term>",
+    "action": "<clear action statement>",
+    "rationale": "<why this action addresses the identified risk>"
+  }
+]
+
+Guidelines:
+- immediate: actions needed within 30 days
+- short_term: 1-6 months
+- long_term: 6+ months strategic actions
+- Provide 6-10 actions total, mix of priorities
+- Make actions specific and actionable for a procurement/supply-chain team"""
 
 
-# ---------------------------------------------------------------------------
-# Agent node builders
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# Helper – robust JSON extraction from LLM output
+# ────────────────────────────────────────────────────────────────────────────
 
-def _build_specialist_node(
-    role: str,
-    system_prompt: str,
-    tools: list,
-    messages_key: str,
-    findings_key: str,
-    status_label: str,
-):
+def _extract_json(text: str) -> Any:
+    """Extract the first JSON object or array from a string."""
+    # Strip markdown fences
+    text = re.sub(r"```(?:json)?", "", text).strip()
+    # Find the outermost { } or [ ]
+    for start_char, end_char in [('{', '}'), ('[', ']')]:
+        start = text.find(start_char)
+        if start == -1:
+            continue
+        depth = 0
+        for i, ch in enumerate(text[start:], start=start):
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+    raise ValueError(f"Could not extract JSON from: {text[:300]}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Node 1 – Intelligence gathering (ReAct agent)
+# ────────────────────────────────────────────────────────────────────────────
+
+def intelligence_node(state: dict) -> dict:
     """
-    Factory that returns a LangGraph node function for a specialist agent.
-    The node runs a ReAct-style loop: LLM decides to call tools until it
-    produces the final JSON findings.
-    """
-    llm = _make_llm(tools)
-    tool_node = ToolNode(tools)
-
-    async def node_fn(state: AgentState) -> Dict[str, Any]:
-        vendor = state["vendor_name"]
-        context = state.get("additional_context", "")
-
-        status_updates = [
-            {
-                "agent": role,
-                "status": "running",
-                "message": f"{status_label} agent started for {vendor}",
-            }
-        ]
-
-        # Initialise message history
-        messages: List[BaseMessage] = state.get(messages_key, [])  # type: ignore
-        if not messages:
-            user_msg = f"Assess {role} risk for vendor: {vendor}."
-            if context:
-                user_msg += f" Additional context: {context}"
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_msg),
-            ]
-
-        # ReAct loop (max 8 iterations to stay within context)
-        findings = ""
-        for iteration in range(8):
-            logger.info(f"[{role}] ReAct iteration {iteration+1}")
-            response: AIMessage = await llm.ainvoke(messages)
-            messages.append(response)
-
-            # If the model called tools, execute them
-            if response.tool_calls:
-                tool_results = await tool_node.ainvoke({"messages": messages})
-                # ToolNode returns a dict with updated messages list
-                messages = tool_results.get("messages", messages)
-                status_updates.append({
-                    "agent": role,
-                    "status": "running",
-                    "message": f"{status_label}: executed {len(response.tool_calls)} tool(s)",
-                })
-            else:
-                # No more tool calls — extract JSON findings
-                content = response.content
-                findings = _extract_json(content)
-                break
-
-        if not findings:
-            findings = json.dumps({
-                "summary": f"Could not complete {role} assessment.",
-                "signals": [],
-                "score": 50,
-            })
-
-        status_updates.append({
-            "agent": role,
-            "status": "done",
-            "message": f"{status_label} assessment complete",
-        })
-
-        return {
-            findings_key: findings,
-            messages_key: messages,
-            "status_messages": status_updates,
-        }
-
-    node_fn.__name__ = f"{role}_agent_node"
-    return node_fn
-
-
-# ---------------------------------------------------------------------------
-# Aggregator node
-# ---------------------------------------------------------------------------
-
-async def aggregator_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Combines specialist findings into a unified risk report.
+    Runs a ReAct agent that iteratively calls search tools to gather
+    risk intelligence about the vendor.
     """
     vendor = state["vendor_name"]
-    llm = _make_llm()  # no tools needed for aggregation
+    logger.info(f"[intelligence_node] Gathering intelligence for: {vendor}")
 
-    status_updates = [
-        {
-            "agent": "aggregator",
-            "status": "running",
-            "message": "Synthesising all specialist findings...",
-        }
-    ]
+    llm = get_llm()
 
-    prompt = f"""Vendor: {vendor}
+    # Build the ReAct agent with all tools bound
+    react_agent = create_react_agent(
+        model=llm,
+        tools=ALL_TOOLS,
+        state_modifier=INTEL_SYSTEM,
+    )
 
-FINANCIAL RISK FINDINGS:
-{state.get('financial_findings', 'Not available')}
+    user_message = (
+        f"Conduct a full vendor risk intelligence assessment for: {vendor}\n"
+        f"Ticker symbol (if known): {state.get('ticker', 'unknown')}\n\n"
+        f"Use ALL available tools to gather information on financial health, "
+        f"operational incidents, compliance issues, social media sentiment, "
+        f"geopolitical exposure, and video/documentary coverage."
+    )
 
-OPERATIONAL RISK FINDINGS:
-{state.get('operational_findings', 'Not available')}
-
-COMPLIANCE RISK FINDINGS:
-{state.get('compliance_findings', 'Not available')}
-
-REPUTATIONAL / SOCIAL RISK FINDINGS:
-{state.get('social_findings', 'Not available')}
-
-Current timestamp: {datetime.utcnow().isoformat()}Z
-
-Synthesise the above into the final risk report JSON as instructed."""
-
-    messages = [
-        SystemMessage(content=AGGREGATOR_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ]
-
-    response: AIMessage = await llm.ainvoke(messages)
-    raw = response.content
-    report_json = _extract_json(raw)
-
-    # Validate / fallback
-    if not report_json:
-        report_json = json.dumps({
-            "vendor_name": vendor,
-            "vendor_description": "Assessment data unavailable.",
-            "risk_level": "medium",
-            "risk_score": {
-                "overall": 50, "financial": 50, "operational": 50,
-                "compliance": 50, "reputational": 50, "geopolitical": 50
-            },
-            "signals": [],
-            "mitigation_actions": [],
-            "executive_summary": "Unable to complete full assessment. Manual review required.",
-            "data_sources_used": [],
-            "assessment_timestamp": datetime.utcnow().isoformat() + "Z",
-        })
-
-    status_updates.append({
-        "agent": "aggregator",
-        "status": "done",
-        "message": "Risk report generated",
-        "data": {"report_preview": "complete"},
+    result = react_agent.invoke({
+        "messages": [HumanMessage(content=user_message)]
     })
 
-    return {
-        "final_report": report_json,
-        "aggregator_messages": messages + [response],
-        "status_messages": status_updates,
-    }
+    # Extract the final AI message as the intelligence brief
+    final_messages = result.get("messages", [])
+    intel_brief = ""
+    for msg in reversed(final_messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            intel_brief = msg.content if isinstance(msg.content, str) else str(msg.content)
+            break
+
+    logger.info(f"[intelligence_node] Brief length: {len(intel_brief)} chars")
+    return {**state, "messages": final_messages, "web_snippets": [intel_brief]}
 
 
-# ---------------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# Node 2 – Risk scoring
+# ────────────────────────────────────────────────────────────────────────────
 
-def build_risk_graph() -> StateGraph:
+def scoring_node(state: dict) -> dict:
     """
-    Builds and compiles the LangGraph state machine for vendor risk assessment.
-
-    Graph topology (parallel specialist agents then aggregation):
-
-        [financial_agent] ─┐
-        [operational_agent]─┤
-                            ├──► [aggregator] ──► END
-        [compliance_agent] ─┤
-        [social_agent] ────┘
+    Takes the intelligence brief and produces structured risk scores + findings.
     """
-    financial_tools = [WebSearchTool(), NewsSearchTool(), FinancialDataTool()]
-    operational_tools = [WebSearchTool(), NewsSearchTool(), OperationalRiskTool()]
-    compliance_tools = [WebSearchTool(), NewsSearchTool(), RegulatorySearchTool()]
-    social_tools = [WebSearchTool(), NewsSearchTool(), SocialMediaSearchTool(), YouTubeSearchTool()]
+    vendor = state["vendor_name"]
+    intel_brief = (state.get("web_snippets") or ["No intelligence gathered."])[0]
+    logger.info(f"[scoring_node] Scoring risk for: {vendor}")
 
-    financial_node = _build_specialist_node(
-        role="financial",
-        system_prompt=FINANCIAL_SYSTEM_PROMPT,
-        tools=financial_tools,
-        messages_key="financial_messages",
-        findings_key="financial_findings",
-        status_label="Financial risk",
-    )
-    operational_node = _build_specialist_node(
-        role="operational",
-        system_prompt=OPERATIONAL_SYSTEM_PROMPT,
-        tools=operational_tools,
-        messages_key="operational_messages",
-        findings_key="operational_findings",
-        status_label="Operational risk",
-    )
-    compliance_node = _build_specialist_node(
-        role="compliance",
-        system_prompt=COMPLIANCE_SYSTEM_PROMPT,
-        tools=compliance_tools,
-        messages_key="compliance_messages",
-        findings_key="compliance_findings",
-        status_label="Compliance risk",
-    )
-    social_node = _build_specialist_node(
-        role="social",
-        system_prompt=SOCIAL_SYSTEM_PROMPT,
-        tools=social_tools,
-        messages_key="social_messages",
-        findings_key="social_findings",
-        status_label="Social / Reputational risk",
-    )
+    llm = get_llm()
 
-    graph = StateGraph(AgentState)
+    prompt = ChatPromptTemplate.from_messages([
+        SystemMessage(content=SCORING_SYSTEM),
+        HumanMessage(content=f"Vendor: {vendor}\n\nIntelligence Brief:\n{intel_brief}"),
+    ])
 
-    # Add nodes
-    graph.add_node("financial_agent", financial_node)
-    graph.add_node("operational_agent", operational_node)
-    graph.add_node("compliance_agent", compliance_node)
-    graph.add_node("social_agent", social_node)
-    graph.add_node("aggregator", aggregator_node)
+    response = llm.invoke(prompt.format_messages(vendor=vendor, intel_brief=intel_brief))
+    raw = response.content if isinstance(response.content, str) else str(response.content)
 
-    # Entry: run all four specialists in parallel (LangGraph handles fan-out)
-    graph.set_entry_point("financial_agent")
-
-    # After each specialist finishes ─► aggregator
-    # LangGraph doesn't do true fan-out automatically, so we chain them and
-    # the aggregator runs after all four are populated in state.
-    graph.add_edge("financial_agent", "operational_agent")
-    graph.add_edge("operational_agent", "compliance_agent")
-    graph.add_edge("compliance_agent", "social_agent")
-    graph.add_edge("social_agent", "aggregator")
-    graph.add_edge("aggregator", END)
-
-    return graph.compile()
-
-
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def _extract_json(text: str) -> str:
-    """Try to pull a JSON object out of a possibly noisy LLM response."""
-    text = text.strip()
-    # Try raw parse first
     try:
-        json.loads(text)
-        return text
+        scored = _extract_json(raw)
+    except ValueError as exc:
+        logger.error(f"[scoring_node] JSON parse error: {exc}")
+        # Fallback defaults
+        scored = {
+            "financial_score": 50.0, "operational_score": 50.0,
+            "compliance_score": 50.0, "reputational_score": 50.0,
+            "geopolitical_score": 50.0, "overall_score": 50.0,
+            "risk_level": "medium",
+            "findings": [],
+            "summary": "Unable to parse structured scoring output. Manual review recommended.",
+            "sources_consulted": [],
+        }
+
+    return {**state, "financial_snippets": [json.dumps(scored)]}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Node 3 – Mitigation generation
+# ────────────────────────────────────────────────────────────────────────────
+
+def mitigation_node(state: dict) -> dict:
+    """
+    Generates prioritised mitigation actions based on the risk scores.
+    """
+    vendor = state["vendor_name"]
+    scored_raw = (state.get("financial_snippets") or ["{}"])[0]
+    logger.info(f"[mitigation_node] Generating mitigations for: {vendor}")
+
+    llm = get_llm()
+
+    prompt = ChatPromptTemplate.from_messages([
+        SystemMessage(content=MITIGATION_SYSTEM),
+        HumanMessage(content=f"Vendor: {vendor}\n\nRisk Assessment:\n{scored_raw}"),
+    ])
+
+    response = llm.invoke(prompt.format_messages())
+    raw = response.content if isinstance(response.content, str) else str(response.content)
+
+    try:
+        mitigations_raw = _extract_json(raw)
+        if not isinstance(mitigations_raw, list):
+            mitigations_raw = []
+    except ValueError:
+        mitigations_raw = []
+
+    # ── Assemble final RiskAssessment ──────────────────────────────────────
+    try:
+        scored = json.loads(scored_raw)
     except Exception:
-        pass
-    # Find first { ... } block
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1]
+        scored = {}
+
+    findings = []
+    for f in scored.get("findings", []):
         try:
-            json.loads(candidate)
-            return candidate
+            findings.append(RiskFinding(**f))
         except Exception:
-            pass
-    # Strip markdown fences
-    cleaned = text.replace("```json", "").replace("```", "").strip()
-    try:
-        json.loads(cleaned)
-        return cleaned
-    except Exception:
-        pass
-    return ""
+            continue
+
+    mitigations = []
+    for m in mitigations_raw:
+        try:
+            mitigations.append(MitigationAction(**m))
+        except Exception:
+            continue
+
+    assessment = RiskAssessment(
+        vendor_name=vendor,
+        overall_score=float(scored.get("overall_score", 50)),
+        risk_level=scored.get("risk_level", "medium"),
+        financial_score=float(scored.get("financial_score", 50)),
+        operational_score=float(scored.get("operational_score", 50)),
+        compliance_score=float(scored.get("compliance_score", 50)),
+        reputational_score=float(scored.get("reputational_score", 50)),
+        geopolitical_score=float(scored.get("geopolitical_score", 50)),
+        findings=findings,
+        mitigations=mitigations,
+        summary=scored.get("summary", "Assessment complete."),
+        sources_consulted=scored.get("sources_consulted", []),
+    )
+
+    return {**state, "assessment": assessment}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Build and compile the graph
+# ────────────────────────────────────────────────────────────────────────────
+
+def build_risk_graph():
+    """
+    Constructs and compiles the vendor risk LangGraph.
+    Returns a compiled graph ready for .invoke().
+    """
+    builder = StateGraph(dict)
+
+    # Register nodes
+    builder.add_node("intelligence", intelligence_node)
+    builder.add_node("scoring", scoring_node)
+    builder.add_node("mitigation", mitigation_node)
+
+    # Wire edges: START → intelligence → scoring → mitigation → END
+    builder.add_edge(START, "intelligence")
+    builder.add_edge("intelligence", "scoring")
+    builder.add_edge("scoring", "mitigation")
+    builder.add_edge("mitigation", END)
+
+    return builder.compile()
+
+
+# Singleton compiled graph (instantiated once at import time)
+risk_graph = build_risk_graph()

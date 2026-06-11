@@ -1,129 +1,126 @@
-# OIL VRM — Oil Vendor Risk Management System
+# 🛢️ OIL Vendor Risk Management
 
-AI-powered multi-agent platform that assesses third-party risk for oil vendors using
-LangGraph, FastAPI, and a local vLLM inference server (AMD ROCm).
+AI-powered third-party vendor risk assessment platform built with **LangGraph**, **FastAPI**, and a clean HTML/CSS/JS frontend — optimised for AMD ROCm + vLLM cloud instances.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-Browser (React + Vite)
-       │  SSE stream  │  REST
-       ▼              ▼
-   FastAPI (port 8080)
-       │
-   LangGraph State Machine
-       │
-   ┌───┴─────────────────────────────────┐
-   │ financial_agent → operational_agent  │
-   │ → compliance_agent → social_agent    │
-   │ → aggregator_node → END              │
-   └──────────────────────────────────────┘
-       │
-   Tool calls (7 tools)
-   • WebSearchTool        – DuckDuckGo web search
-   • NewsSearchTool       – DuckDuckGo news
-   • SocialMediaSearchTool– X / Reddit via DDG
-   • YouTubeSearchTool    – YouTube via DDG
-   • RegulatorySearchTool – SEC / EPA / OSHA
-   • FinancialDataTool    – Credit, earnings, debt
-   • OperationalRiskTool  – Incidents, spills
-       │
-   vLLM (port 8000, AMD GPU / ROCm)
-   Model: mistralai/Mistral-7B-Instruct-v0.3
+┌─────────────────────────────────────────────────────────┐
+│                    FastAPI Backend                       │
+│                                                         │
+│  POST /api/assess                                       │
+│       │                                                 │
+│       ▼                                                 │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │           LangGraph Pipeline (risk_graph)        │   │
+│  │                                                  │   │
+│  │  START                                           │   │
+│  │    │                                             │   │
+│  │    ▼                                             │   │
+│  │  [intelligence_node]  ← ReAct agent              │   │
+│  │    │  calls 7 tools:                             │   │
+│  │    │  • web_search                               │   │
+│  │    │  • financial_news_search                    │   │
+│  │    │  • compliance_search                        │   │
+│  │    │  • social_media_search                      │   │
+│  │    │  • video_intelligence_search                │   │
+│  │    │  • geopolitical_risk_search                 │   │
+│  │    │  • operational_incident_search              │   │
+│  │    │                                             │   │
+│  │    ▼                                             │   │
+│  │  [scoring_node]   ← LLM → structured JSON scores │   │
+│  │    │                                             │   │
+│  │    ▼                                             │   │
+│  │  [mitigation_node] ← LLM → mitigation actions   │   │
+│  │    │                                             │   │
+│  │  END → RiskAssessment                           │   │
+│  └─────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-Real-world oil vendors included by default:
-- **Valero Energy Corporation** (USA, Refining & Marketing)
-- **Suncor Energy** (Canada, Integrated Oil & Gas)
-- **Petrobras** (Brazil, National Oil Company)
+---
+
+## Pre-configured Real Vendors
+
+| Vendor | Ticker | Why Interesting for Risk |
+|--------|--------|--------------------------|
+| **ExxonMobil** | XOM | Largest US oil major; climate litigation exposure, Guyana expansion risk |
+| **Shell plc** | SHEL | Anglo-Dutch; Dutch court climate ruling, LNG transition complexity |
+| **Rosneft** | ROSN | Russian state-controlled; heavy sanctions exposure since 2022, OFAC risk |
 
 ---
 
-## Step-by-Step Setup on AMD GPU Cloud Notebook
+## Step-by-Step Setup on AMD ROCm vLLM Notebook
 
-> These instructions assume you are on the default AMD ROCm + vLLM notebook
-> instance. You will need 3 terminals (or 3 tmux panes).
+### Prerequisites
+- AMD ROCm virtual cloud notebook (MI250/MI300 GPU)
+- Python 3.10+
+- Internet access from the notebook
 
 ---
 
-### Step 1 — Verify your environment
+### Step 1 — Clone / Upload the project
 
-Open a terminal and run:
+In your notebook terminal:
+```bash
+# If using git:
+git clone <your-repo-url> oil-vendor-risk
+cd oil-vendor-risk
+
+# Or upload the zip and extract:
+unzip oil-vendor-risk.zip
+cd oil-vendor-risk
+```
+
+---
+
+### Step 2 — Run the setup script
 
 ```bash
-# Check ROCm
-rocm-smi
-
-# Check Python version (needs 3.10+)
-python3 --version
-
-# Check if vLLM is already installed
-python3 -c "import vllm; print(vllm.__version__)"
+bash setup.sh
 ```
 
-If vLLM is not installed:
-
-```bash
-pip install vllm --extra-index-url https://download.pytorch.org/whl/rocm6.0
-```
+This will:
+- Create a Python virtual environment (`venv/`)
+- Install all dependencies from `requirements.txt`
+- Verify your `.env` file exists
 
 ---
 
-### Step 2 — Upload the project
+### Step 3 — Configure your `.env`
 
-If you are using Jupyter or a file manager, upload the entire `oil-vendor-risk/`
-folder to your home directory, e.g. `/home/user/oil-vendor-risk/`.
-
-Or clone/copy it via the terminal.
-
----
-
-### Step 3 — Set up the Python backend
+Open `.env` in any text editor:
 
 ```bash
-cd ~/oil-vendor-risk/backend
-
-# Create a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Set up .env
-cp .env.example .env
+nano .env
 ```
 
-Open `.env` and verify/edit:
-
+**Option A — Use your local vLLM (recommended for AMD ROCm):**
 ```
+USE_AZURE=false
 VLLM_BASE_URL=http://localhost:8000/v1
-VLLM_MODEL=mistralai/Mistral-7B-Instruct-v0.3
-BACKEND_PORT=8080
-CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+VLLM_MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.3
+```
+
+**Option B — Use Azure OpenAI (if vLLM is not running):**
+```
+USE_AZURE=true
+AZURE_OPENAI_API_KEY=sk-...
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+AZURE_OPENAI_API_VERSION=2024-02-01
 ```
 
 ---
 
-### Step 4 — Install Node.js (if not already available)
+### Step 4 — Start vLLM (if using local model)
+
+**Open a NEW terminal tab** and run:
 
 ```bash
-# Check if node is installed
-node --version   # needs v18+
-
-# If not installed:
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
-```
-
----
-
-### Step 5 — Start vLLM (Terminal 1)
-
-```bash
-cd ~/oil-vendor-risk
+cd oil-vendor-risk
 bash start_vllm.sh
 ```
 
@@ -133,151 +130,87 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000
 ```
 
-This downloads the model on first run (~14 GB). Subsequent starts are fast.
+This takes 1–3 minutes to download/load the model weights.
 
-**Low VRAM alternative** (if you have < 16 GB GPU VRAM):
+**Verify it's working:**
 ```bash
-bash start_vllm.sh TinyLlama/TinyLlama-1.1B-Chat-v1.0
-# Then edit .env: VLLM_MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+curl http://localhost:8000/v1/models
 ```
 
 ---
 
-### Step 6 — Start the FastAPI backend (Terminal 2)
+### Step 5 — Start the FastAPI application
 
+**In your original terminal:**
 ```bash
-cd ~/oil-vendor-risk/backend
-source .venv/bin/activate
-python main.py
+source venv/bin/activate
+bash run.sh
 ```
 
-You should see:
+You'll see:
 ```
-INFO:     Uvicorn running on http://0.0.0.0:8080
-```
-
-Test it:
-```bash
-curl http://localhost:8080/health
+══════════════════════════════════════════════════════
+  OIL Vendor Risk Management
+  http://0.0.0.0:7860
+══════════════════════════════════════════════════════
 ```
 
 ---
 
-### Step 7 — Start the React frontend (Terminal 3)
+### Step 6 — Open the UI
 
-```bash
-cd ~/oil-vendor-risk/frontend
-npm install          # first time only, downloads packages
-npm run dev
+In your browser navigate to:
+```
+http://localhost:7860
 ```
 
-You should see:
-```
-  VITE v5.x.x  ready in 800ms
-  ➜  Local:   http://localhost:5173/
-```
+If using a cloud notebook with port forwarding, use the forwarded URL for port **7860**.
 
 ---
 
-### Step 8 — Open the application
+## How to Use
 
-In your browser (or Jupyter Lab's built-in browser), navigate to:
-
-```
-http://localhost:5173
-```
-
-You will see the OIL VRM dashboard.
-
-**To run an assessment:**
-1. Click one of the pre-loaded vendors (Valero, Suncor, or Petrobras), or type a custom vendor name.
-2. Click **Start Risk Assessment**.
-3. Watch the live Agent Activity Feed as each specialist agent runs.
-4. The full risk report appears once all agents complete (typically 2–5 minutes).
-
----
-
-## Accessing from outside the notebook
-
-If your AMD cloud notebook exposes a public URL (e.g. through a proxy or tunnel),
-you may need to:
-
-```bash
-# Option A: Use SSH port forwarding from your local machine
-ssh -L 5173:localhost:5173 -L 8080:localhost:8080 user@your-amd-instance
-
-# Option B: Use a cloudflare tunnel (no auth needed)
-pip install cloudflared
-cloudflared tunnel --url http://localhost:5173
-```
+1. **Quick Select**: Click one of the three preset vendors (ExxonMobil, Shell, Rosneft)
+2. **Custom Vendor**: Type any oil company name in the input field
+3. **Click "Assess Risk"** — the pipeline runs for ~60–90 seconds
+4. Review the **Risk Score**, **Category Scores**, **Findings**, **Radar Chart**, **Mitigations**, and **Sources**
 
 ---
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---|---|
-| `ModuleNotFoundError: langchain` | Run `pip install -r requirements.txt` inside the venv |
-| `Connection refused 8000` | vLLM hasn't finished starting yet; wait ~60s |
-| `CUDA out of memory` on AMD | Add `--quantization awq` to start_vllm.sh or use a smaller model |
-| Empty agent response (JSON parse error) | The model produced malformed JSON; try a larger model |
-| `CORS error` in browser | Make sure `CORS_ORIGINS` in `.env` matches your frontend URL |
-| `duckduckgo_search` rate limit | Add `time.sleep(2)` between tool calls or reduce `max_results` |
-| Frontend shows white page | Run `npm install` in the `frontend/` folder |
+| Problem | Solution |
+|---------|----------|
+| `ModuleNotFoundError: langchain` | Run `pip install -r requirements.txt` inside `venv` |
+| `Connection refused localhost:8000` | Start vLLM first: `bash start_vllm.sh` |
+| Assessment returns error | Check the FastAPI terminal for full traceback |
+| vLLM OOM (out of memory) | Lower `--gpu-memory-utilization 0.75` in `start_vllm.sh` |
+| Slow responses | Expected — 7B model + 7 tool calls ≈ 60–120s |
+| Azure 401 Unauthorized | Double-check `AZURE_OPENAI_API_KEY` and endpoint in `.env` |
 
 ---
 
-## Project structure
+## File Structure
 
 ```
 oil-vendor-risk/
+├── main.py                          # FastAPI app entry point
+├── requirements.txt
+├── .env                             # Your config (do not commit)
+├── setup.sh                         # One-shot setup
+├── start_vllm.sh                    # Start vLLM server
+├── run.sh                           # Start FastAPI
 ├── backend/
 │   ├── agents/
-│   │   └── risk_graph.py      ← LangGraph state machine + all agent nodes
+│   │   ├── llm_factory.py           # vLLM / Azure LLM selector
+│   │   └── risk_graph.py            # LangGraph pipeline (3 nodes)
 │   ├── tools/
-│   │   └── search_tools.py    ← 7 LangChain BaseTool subclasses
-│   ├── models/
-│   │   └── schemas.py         ← Pydantic models + vendor list
-│   ├── main.py                ← FastAPI app + SSE streaming endpoint
-│   ├── requirements.txt
-│   └── .env.example
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── Header.jsx
-│   │   │   ├── VendorSelector.jsx
-│   │   │   ├── AgentFeed.jsx        ← Live SSE event feed
-│   │   │   ├── RiskScoreCard.jsx    ← Gauge + category bars
-│   │   │   ├── RiskSignalsTable.jsx ← Filterable signals table
-│   │   │   ├── MitigationPanel.jsx  ← Expandable action cards
-│   │   │   └── ExecutiveSummary.jsx ← Text + radar chart
-│   │   ├── utils/api.js
-│   │   ├── App.jsx
-│   │   ├── main.jsx
-│   │   └── index.css
-│   ├── index.html
-│   ├── package.json
-│   └── vite.config.js
-├── start_vllm.sh
-├── start_backend.sh
-├── start_frontend.sh
-└── README.md
+│   │   └── search_tools.py          # 7 @tool-decorated LangChain tools
+│   └── models/
+│       └── schemas.py               # Pydantic models
+└── frontend/
+    ├── templates/index.html         # Main UI
+    └── static/
+        ├── css/app.css
+        └── js/app.js
 ```
-
----
-
-## Customisation
-
-**Add a new vendor to the quick-pick list:**
-Edit `backend/models/schemas.py` → `KNOWN_OIL_VENDORS`.
-
-**Change the LLM model:**
-Edit `VLLM_MODEL` in `backend/.env` and restart both vLLM and the backend.
-
-**Add a new tool:**
-1. Create a new `BaseTool` subclass in `backend/tools/search_tools.py`.
-2. Add it to the appropriate specialist agent's tool list in `backend/agents/risk_graph.py`.
-
-**Tune risk scoring:**
-Edit the `AGGREGATOR_SYSTEM_PROMPT` in `backend/agents/risk_graph.py` to adjust
-category weightings.
